@@ -199,7 +199,7 @@ def list_facts(
             if len(content) > 60:
                 content = content[:57] + "..."
 
-            status = "Pending" if fact.status == "pending" else "Approved"
+            status = "Approved" if fact.approved else "Pending"
             confidence = f"{fact.confidence:.0%}"
 
             table.add_row(str(fact.id), content, confidence, status)
