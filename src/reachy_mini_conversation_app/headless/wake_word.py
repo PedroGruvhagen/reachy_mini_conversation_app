@@ -2,12 +2,22 @@
 
 Provides offline detection of "Hey Lily" wake phrase with configurable
 confidence thresholds and cooldown logic.
+
+Available pre-trained models (as of 2025):
+- hey_jarvis (recommended as proxy for "Hey Lily")
+- alexa
+- hey_mycroft
+- hey_rhasspy
+- ok_nabu
+
+Custom model training can be done using OpenWakeWord tools.
 """
 
+import os
 import asyncio
 import logging
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, List, Optional
 from datetime import datetime
 
 import numpy as np
@@ -30,6 +40,10 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 DEFAULT_COOLDOWN_SECONDS = 10.0
 WAKE_WORD_SAMPLE_RATE = 16000  # OpenWakeWord expects 16kHz
 
+# Available pre-trained models
+AVAILABLE_MODELS = ["hey_jarvis", "alexa", "hey_mycroft", "hey_rhasspy", "ok_nabu"]
+DEFAULT_MODEL = "hey_jarvis"  # Best proxy for "Hey Lily" (similar phonetics)
+
 
 class WakeWordEngine:
     """Wake word detection engine using OpenWakeWord.
@@ -40,33 +54,49 @@ class WakeWordEngine:
 
     def __init__(
         self,
+        model_name: Optional[str] = None,
         model_path: Optional[str] = None,
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         on_wake_word: Optional[Callable[[float], None]] = None,
+        database: Optional[Any] = None,
     ) -> None:
         """Initialize the wake word engine.
 
         Args:
-            model_path: Path to custom wake word model. If None, uses default.
+            model_name: Name of pre-trained model (hey_jarvis, alexa, etc).
+            model_path: Path to custom wake word model. Overrides model_name.
             confidence_threshold: Minimum confidence score to trigger (0.0-1.0).
             cooldown_seconds: Seconds to wait between detections (prevent spam).
             on_wake_word: Callback when wake word detected (receives confidence).
+            database: Optional MemoryDatabase for logging wake events.
         """
         if not OPENWAKEWORD_AVAILABLE:
             logger.warning("openwakeword not available - wake word detection disabled")
             self._initialized = False
             return
 
-        self._model_path = model_path
-        self._confidence_threshold = confidence_threshold
-        self._cooldown_seconds = cooldown_seconds
+        # Model configuration (env var > parameter > default)
+        self._model_name = (
+            os.getenv("WAKE_WORD_MODEL", model_name)
+            or DEFAULT_MODEL
+        )
+        self._model_path = model_path or os.getenv("WAKE_WORD_MODEL_PATH")
+        self._confidence_threshold = float(
+            os.getenv("WAKE_WORD_CONFIDENCE_THRESHOLD", str(confidence_threshold))
+        )
+        self._cooldown_seconds = float(
+            os.getenv("WAKE_WORD_COOLDOWN_SECONDS", str(cooldown_seconds))
+        )
         self._on_wake_word = on_wake_word
+        self._database = database
 
         self._model: Optional[OWWModel] = None
+        self._active_model_name: Optional[str] = None
         self._initialized = False
         self._last_detection_time: Optional[datetime] = None
         self._detection_count = 0
+        self._false_positive_count = 0  # For tracking rejected detections
 
     def initialize(self) -> bool:
         """Initialize the wake word model.
@@ -81,17 +111,35 @@ class WakeWordEngine:
             # Download pre-trained models if needed
             openwakeword.utils.download_models()
 
-            # Load model - use default models for now
-            # TODO: Train custom "Hey Lily" model
-            self._model = OWWModel(
-                wakeword_models=["hey_jarvis"],  # Use as proxy until we train "hey_lily"
-                inference_framework="onnx",
-            )
+            # Determine which model(s) to load
+            if self._model_path and Path(self._model_path).exists():
+                # Use custom model file
+                logger.info(f"Loading custom wake word model: {self._model_path}")
+                self._model = OWWModel(
+                    wakeword_models=[self._model_path],
+                    inference_framework="onnx",
+                )
+                self._active_model_name = Path(self._model_path).stem
+            else:
+                # Use pre-trained model
+                model_to_use = self._model_name
+                if model_to_use not in AVAILABLE_MODELS:
+                    logger.warning(
+                        f"Model '{model_to_use}' not in available models, using '{DEFAULT_MODEL}'"
+                    )
+                    model_to_use = DEFAULT_MODEL
+
+                logger.info(f"Loading pre-trained wake word model: {model_to_use}")
+                self._model = OWWModel(
+                    wakeword_models=[model_to_use],
+                    inference_framework="onnx",
+                )
+                self._active_model_name = model_to_use
 
             self._initialized = True
             logger.info(
-                f"WakeWordEngine initialized: threshold={self._confidence_threshold}, "
-                f"cooldown={self._cooldown_seconds}s"
+                f"WakeWordEngine initialized: model={self._active_model_name}, "
+                f"threshold={self._confidence_threshold}, cooldown={self._cooldown_seconds}s"
             )
             return True
 
@@ -153,6 +201,20 @@ class WakeWordEngine:
                         f"Wake word detected: {model_name} with confidence {confidence:.3f}"
                     )
 
+                    # Log to database if available
+                    if self._database:
+                        try:
+                            self._database.add_wake_event(
+                                confidence=float(confidence),
+                                model_name=model_name,
+                                metadata={
+                                    "threshold": self._confidence_threshold,
+                                    "detection_number": self._detection_count,
+                                },
+                            )
+                        except Exception as db_err:
+                            logger.debug(f"Failed to log wake event to database: {db_err}")
+
                     if self._on_wake_word:
                         try:
                             self._on_wake_word(confidence)
@@ -193,8 +255,40 @@ class WakeWordEngine:
         self._confidence_threshold = max(0.0, min(1.0, threshold))
         logger.info(f"Wake word confidence threshold set to {self._confidence_threshold}")
 
+    def get_stats(self) -> dict[str, Any]:
+        """Get engine statistics.
+
+        Returns:
+            Dictionary with engine stats.
+        """
+        return {
+            "initialized": self._initialized,
+            "model_name": self._active_model_name,
+            "confidence_threshold": self._confidence_threshold,
+            "cooldown_seconds": self._cooldown_seconds,
+            "detection_count": self._detection_count,
+            "in_cooldown": self._in_cooldown(),
+            "last_detection_time": (
+                self._last_detection_time.isoformat()
+                if self._last_detection_time
+                else None
+            ),
+        }
+
+    @staticmethod
+    def get_available_models() -> List[str]:
+        """Get list of available pre-trained models.
+
+        Returns:
+            List of model names.
+        """
+        return AVAILABLE_MODELS.copy()
+
     def shutdown(self) -> None:
         """Shutdown the wake word engine."""
-        logger.info(f"WakeWordEngine shutting down ({self._detection_count} total detections)")
+        logger.info(
+            f"WakeWordEngine shutting down: model={self._active_model_name}, "
+            f"detections={self._detection_count}"
+        )
         self._initialized = False
         self._model = None

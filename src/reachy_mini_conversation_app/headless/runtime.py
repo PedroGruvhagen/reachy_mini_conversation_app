@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from dotenv import load_dotenv
 
 from reachy_mini_conversation_app.headless.state_machine import StateMachine, ConversationState
@@ -44,6 +45,9 @@ class HeadlessRuntime:
         self._silence_timeout = float(os.getenv("SILENCE_TIMEOUT_SECONDS", "120"))
         self._wake_word_threshold = float(os.getenv("WAKE_WORD_CONFIDENCE_THRESHOLD", "0.5"))
         self._openai_api_key = os.getenv("OPENAI_API_KEY")
+        # VAD (Voice Activity Detection) threshold for speech detection
+        # Typical values: 500-2000 for int16 audio, lower = more sensitive
+        self._speech_energy_threshold = float(os.getenv("SPEECH_ENERGY_THRESHOLD", "1000"))
 
         # Components (initialized lazily)
         self._state_machine: Optional[StateMachine] = None
@@ -98,25 +102,26 @@ class HeadlessRuntime:
         """
         logger.info("Initializing HeadlessRuntime...")
 
+        # Initialize memory manager first (needed for wake word logging and transcription)
+        self._memory_manager = MemoryManager(openai_api_key=self._openai_api_key)
+
         # Initialize state machine
         self._state_machine = StateMachine(
             silence_timeout_seconds=self._silence_timeout,
             on_state_change=self._on_state_change,
         )
 
-        # Initialize wake word engine
+        # Initialize wake word engine with database for event logging
         self._wake_word_engine = WakeWordEngine(
             confidence_threshold=self._wake_word_threshold,
             on_wake_word=self._on_wake_word_detected,
+            database=self._memory_manager.db,
         )
         if not self._wake_word_engine.initialize():
             logger.warning("Wake word engine failed to initialize - will run without wake word")
 
         # Initialize audio router
         self._audio_router = AudioRouter()
-
-        # Initialize memory manager first (needed for transcription storage)
-        self._memory_manager = MemoryManager(openai_api_key=self._openai_api_key)
 
         # Initialize transcription service with database for storage
         self._transcription_service = TranscriptionService(
@@ -197,9 +202,16 @@ class HeadlessRuntime:
                 # PHASE 4 INTEGRATION POINT: OpenAI Realtime API
                 # This is where the OpenAI Realtime WebSocket client will be integrated.
                 # The audio (24kHz, int16) will be sent to OpenAI for real-time conversation.
-                # For now, just track speech activity for state machine timing.
-                if self._state_machine:
-                    await self._state_machine.on_user_speech()
+
+                # Voice Activity Detection (VAD) using RMS energy
+                # Only signal speech activity if audio energy exceeds threshold
+                # This prevents the silence timer from resetting on every frame
+                audio_float = audio.astype(np.float32)
+                rms_energy = np.sqrt(np.mean(audio_float ** 2))
+
+                if rms_energy > self._speech_energy_threshold:
+                    if self._state_machine:
+                        await self._state_machine.on_user_speech()
 
             except asyncio.CancelledError:
                 break

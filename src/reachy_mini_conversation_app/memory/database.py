@@ -69,6 +69,18 @@ class ConversationTranscript:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class WakeEvent:
+    """Represents a wake word detection event."""
+
+    id: int
+    timestamp: datetime
+    confidence: float
+    model_name: Optional[str] = None
+    triggered_session_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class MemoryDatabase:
     """DuckDB database manager for the memory system.
 
@@ -185,6 +197,18 @@ class MemoryDatabase:
             )
         """)
 
+        # Wake word detection events for analytics and debugging
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wake_events (
+                id INTEGER PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                confidence FLOAT NOT NULL,
+                model_name VARCHAR(100),
+                triggered_session_id VARCHAR(64),
+                metadata JSON
+            )
+        """)
+
         # Schema version tracking
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
@@ -207,6 +231,7 @@ class MemoryDatabase:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_person ON conversation_transcripts(person_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_started ON conversation_transcripts(started_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_ended ON conversation_transcripts(ended_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wake_events_timestamp ON wake_events(timestamp)")
 
         conn.commit()
 
@@ -1111,3 +1136,146 @@ class MemoryDatabase:
             "SELECT COALESCE(SUM(duration_seconds), 0) FROM conversation_transcripts"
         ).fetchone()
         return result[0] if result else 0.0
+
+    # ---------- Wake Event Operations ----------
+
+    def add_wake_event(
+        self,
+        confidence: float,
+        model_name: Optional[str] = None,
+        triggered_session_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Log a wake word detection event.
+
+        Args:
+            confidence: Detection confidence score (0.0-1.0).
+            model_name: Name of the wake word model that triggered.
+            triggered_session_id: Session ID started by this wake event.
+            metadata: Additional event metadata.
+
+        Returns:
+            ID of the created wake event.
+        """
+        with self._lock:
+            metadata_json = json.dumps(metadata) if metadata else None
+            result = self._conn.execute(
+                """
+                INSERT INTO wake_events (confidence, model_name, triggered_session_id, metadata)
+                VALUES (?, ?, ?, ?)
+                RETURNING id
+                """,
+                [confidence, model_name, triggered_session_id, metadata_json],
+            ).fetchone()
+            self._conn.commit()
+            return result[0] if result else 0
+
+    def get_recent_wake_events(self, limit: int = 50) -> List[WakeEvent]:
+        """Get recent wake word detection events.
+
+        Args:
+            limit: Maximum events to return.
+
+        Returns:
+            List of wake events, most recent first.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, timestamp, confidence, model_name, triggered_session_id, metadata
+            FROM wake_events
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+
+        events = []
+        for row in rows:
+            metadata = {}
+            if row[5]:
+                try:
+                    metadata = json.loads(row[5])
+                except json.JSONDecodeError:
+                    pass
+            events.append(
+                WakeEvent(
+                    id=row[0],
+                    timestamp=row[1],
+                    confidence=row[2],
+                    model_name=row[3],
+                    triggered_session_id=row[4],
+                    metadata=metadata,
+                )
+            )
+        return events
+
+    def get_wake_event_count(self, hours: Optional[int] = None) -> int:
+        """Get count of wake events.
+
+        Args:
+            hours: If specified, only count events in the last N hours.
+
+        Returns:
+            Count of wake events.
+        """
+        if hours:
+            result = self._conn.execute(
+                """
+                SELECT COUNT(*) FROM wake_events
+                WHERE timestamp > CURRENT_TIMESTAMP - INTERVAL ? HOUR
+                """,
+                [hours],
+            ).fetchone()
+        else:
+            result = self._conn.execute("SELECT COUNT(*) FROM wake_events").fetchone()
+        return result[0] if result else 0
+
+    def get_wake_event_stats(self, hours: int = 24) -> Dict[str, Any]:
+        """Get wake event statistics for the specified period.
+
+        Args:
+            hours: Number of hours to analyze.
+
+        Returns:
+            Dictionary with statistics.
+        """
+        result = self._conn.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                AVG(confidence) as avg_confidence,
+                MIN(confidence) as min_confidence,
+                MAX(confidence) as max_confidence
+            FROM wake_events
+            WHERE timestamp > CURRENT_TIMESTAMP - INTERVAL ? HOUR
+            """,
+            [hours],
+        ).fetchone()
+
+        return {
+            "period_hours": hours,
+            "total_events": result[0] if result else 0,
+            "avg_confidence": round(result[1], 3) if result and result[1] else 0.0,
+            "min_confidence": round(result[2], 3) if result and result[2] else 0.0,
+            "max_confidence": round(result[3], 3) if result and result[3] else 0.0,
+        }
+
+    def cleanup_old_wake_events(self, days: int = 30) -> int:
+        """Delete wake events older than specified days.
+
+        Args:
+            days: Delete events older than this many days.
+
+        Returns:
+            Number of events deleted.
+        """
+        with self._lock:
+            result = self._conn.execute(
+                """
+                DELETE FROM wake_events
+                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL ? DAY
+                """,
+                [days],
+            )
+            self._conn.commit()
+            return result.rowcount if hasattr(result, 'rowcount') else 0
