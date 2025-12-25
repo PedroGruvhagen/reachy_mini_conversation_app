@@ -66,6 +66,8 @@ class ConversationTranscript:
     duration_seconds: float
     started_at: datetime
     ended_at: datetime
+    speaker_diarization: Optional[List[Dict[str, Any]]] = None
+    word_timestamps: Optional[List[Dict[str, Any]]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -192,6 +194,8 @@ class MemoryDatabase:
                 duration_seconds FLOAT DEFAULT 0.0,
                 started_at TIMESTAMP NOT NULL,
                 ended_at TIMESTAMP NOT NULL,
+                speaker_diarization JSON,
+                word_timestamps JSON,
                 metadata JSON,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -907,6 +911,8 @@ class MemoryDatabase:
         person_name: Optional[str] = None,
         audio_path: Optional[str] = None,
         duration_seconds: float = 0.0,
+        speaker_diarization: Optional[List[Dict[str, Any]]] = None,
+        word_timestamps: Optional[List[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Add a new conversation transcript.
@@ -920,6 +926,8 @@ class MemoryDatabase:
             person_name: Optional name of the person.
             audio_path: Optional path to the audio file.
             duration_seconds: Duration of the conversation.
+            speaker_diarization: Speaker diarization data (speaker labels with timestamps).
+            word_timestamps: Word-level timestamps from transcription.
             metadata: Optional metadata dictionary.
 
         Returns:
@@ -927,17 +935,21 @@ class MemoryDatabase:
         """
         with self._lock:
             metadata_json = json.dumps(metadata) if metadata else None
+            diarization_json = json.dumps(speaker_diarization) if speaker_diarization else None
+            timestamps_json = json.dumps(word_timestamps) if word_timestamps else None
 
             result = self._conn.execute(
                 """
                 INSERT INTO conversation_transcripts
                 (session_id, person_id, person_name, transcript, audio_path,
-                 duration_seconds, started_at, ended_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 duration_seconds, started_at, ended_at, speaker_diarization,
+                 word_timestamps, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id
                 """,
                 [session_id, person_id, person_name, transcript, audio_path,
-                 duration_seconds, started_at, ended_at, metadata_json],
+                 duration_seconds, started_at, ended_at, diarization_json,
+                 timestamps_json, metadata_json],
             ).fetchone()
 
             self._conn.commit()
@@ -955,7 +967,8 @@ class MemoryDatabase:
         row = self._conn.execute(
             """
             SELECT id, session_id, person_id, person_name, transcript, audio_path,
-                   duration_seconds, started_at, ended_at, metadata
+                   duration_seconds, started_at, ended_at, speaker_diarization,
+                   word_timestamps, metadata
             FROM conversation_transcripts
             WHERE session_id = ?
             """,
@@ -965,7 +978,9 @@ class MemoryDatabase:
         if row is None:
             return None
 
-        metadata = json.loads(row[9]) if row[9] else {}
+        speaker_diarization = json.loads(row[9]) if row[9] else None
+        word_timestamps = json.loads(row[10]) if row[10] else None
+        metadata = json.loads(row[11]) if row[11] else {}
         return ConversationTranscript(
             id=row[0],
             session_id=row[1],
@@ -976,6 +991,8 @@ class MemoryDatabase:
             duration_seconds=row[6],
             started_at=row[7],
             ended_at=row[8],
+            speaker_diarization=speaker_diarization,
+            word_timestamps=word_timestamps,
             metadata=metadata,
         )
 
@@ -991,7 +1008,8 @@ class MemoryDatabase:
         rows = self._conn.execute(
             """
             SELECT id, session_id, person_id, person_name, transcript, audio_path,
-                   duration_seconds, started_at, ended_at, metadata
+                   duration_seconds, started_at, ended_at, speaker_diarization,
+                   word_timestamps, metadata
             FROM conversation_transcripts
             ORDER BY ended_at DESC
             LIMIT ?
@@ -1001,7 +1019,9 @@ class MemoryDatabase:
 
         transcripts = []
         for row in rows:
-            metadata = json.loads(row[9]) if row[9] else {}
+            speaker_diarization = json.loads(row[9]) if row[9] else None
+            word_timestamps = json.loads(row[10]) if row[10] else None
+            metadata = json.loads(row[11]) if row[11] else {}
             transcripts.append(
                 ConversationTranscript(
                     id=row[0],
@@ -1013,6 +1033,8 @@ class MemoryDatabase:
                     duration_seconds=row[6],
                     started_at=row[7],
                     ended_at=row[8],
+                    speaker_diarization=speaker_diarization,
+                    word_timestamps=word_timestamps,
                     metadata=metadata,
                 )
             )
@@ -1031,7 +1053,8 @@ class MemoryDatabase:
         rows = self._conn.execute(
             """
             SELECT id, session_id, person_id, person_name, transcript, audio_path,
-                   duration_seconds, started_at, ended_at, metadata
+                   duration_seconds, started_at, ended_at, speaker_diarization,
+                   word_timestamps, metadata
             FROM conversation_transcripts
             WHERE LOWER(transcript) LIKE LOWER(?)
             ORDER BY ended_at DESC
@@ -1042,7 +1065,9 @@ class MemoryDatabase:
 
         transcripts = []
         for row in rows:
-            metadata = json.loads(row[9]) if row[9] else {}
+            speaker_diarization = json.loads(row[9]) if row[9] else None
+            word_timestamps = json.loads(row[10]) if row[10] else None
+            metadata = json.loads(row[11]) if row[11] else {}
             transcripts.append(
                 ConversationTranscript(
                     id=row[0],
@@ -1054,6 +1079,8 @@ class MemoryDatabase:
                     duration_seconds=row[6],
                     started_at=row[7],
                     ended_at=row[8],
+                    speaker_diarization=speaker_diarization,
+                    word_timestamps=word_timestamps,
                     metadata=metadata,
                 )
             )
@@ -1072,7 +1099,8 @@ class MemoryDatabase:
         rows = self._conn.execute(
             """
             SELECT id, session_id, person_id, person_name, transcript, audio_path,
-                   duration_seconds, started_at, ended_at, metadata
+                   duration_seconds, started_at, ended_at, speaker_diarization,
+                   word_timestamps, metadata
             FROM conversation_transcripts
             WHERE person_id = ?
             ORDER BY ended_at DESC
@@ -1083,7 +1111,9 @@ class MemoryDatabase:
 
         transcripts = []
         for row in rows:
-            metadata = json.loads(row[9]) if row[9] else {}
+            speaker_diarization = json.loads(row[9]) if row[9] else None
+            word_timestamps = json.loads(row[10]) if row[10] else None
+            metadata = json.loads(row[11]) if row[11] else {}
             transcripts.append(
                 ConversationTranscript(
                     id=row[0],
@@ -1095,6 +1125,8 @@ class MemoryDatabase:
                     duration_seconds=row[6],
                     started_at=row[7],
                     ended_at=row[8],
+                    speaker_diarization=speaker_diarization,
+                    word_timestamps=word_timestamps,
                     metadata=metadata,
                 )
             )
@@ -1136,6 +1168,133 @@ class MemoryDatabase:
             "SELECT COALESCE(SUM(duration_seconds), 0) FROM conversation_transcripts"
         ).fetchone()
         return result[0] if result else 0.0
+
+    def get_transcript_by_id(self, transcript_id: int) -> Optional[ConversationTranscript]:
+        """Get a transcript by ID.
+
+        Args:
+            transcript_id: The transcript ID.
+
+        Returns:
+            ConversationTranscript if found, None otherwise.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, session_id, person_id, person_name, transcript, audio_path,
+                   duration_seconds, started_at, ended_at, speaker_diarization,
+                   word_timestamps, metadata
+            FROM conversation_transcripts
+            WHERE id = ?
+            """,
+            [transcript_id],
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        speaker_diarization = json.loads(row[9]) if row[9] else None
+        word_timestamps = json.loads(row[10]) if row[10] else None
+        metadata = json.loads(row[11]) if row[11] else {}
+        return ConversationTranscript(
+            id=row[0],
+            session_id=row[1],
+            person_id=row[2],
+            person_name=row[3],
+            transcript=row[4],
+            audio_path=row[5],
+            duration_seconds=row[6],
+            started_at=row[7],
+            ended_at=row[8],
+            speaker_diarization=speaker_diarization,
+            word_timestamps=word_timestamps,
+            metadata=metadata,
+        )
+
+    def cleanup_old_transcripts(self, days: int = 90) -> tuple[int, List[str]]:
+        """Delete transcripts older than specified days.
+
+        Args:
+            days: Delete transcripts older than this many days.
+
+        Returns:
+            Tuple of (count deleted, list of audio file paths that can be deleted).
+        """
+        # First get the audio paths for files that can be deleted
+        rows = self._conn.execute(
+            """
+            SELECT audio_path FROM conversation_transcripts
+            WHERE ended_at < CURRENT_TIMESTAMP - INTERVAL ? DAY
+            AND audio_path IS NOT NULL
+            """,
+            [days],
+        ).fetchall()
+
+        audio_paths = [row[0] for row in rows if row[0]]
+
+        with self._lock:
+            result = self._conn.execute(
+                """
+                DELETE FROM conversation_transcripts
+                WHERE ended_at < CURRENT_TIMESTAMP - INTERVAL ? DAY
+                """,
+                [days],
+            )
+            self._conn.commit()
+            count = result.rowcount if hasattr(result, 'rowcount') else 0
+
+        return count, audio_paths
+
+    def get_transcripts_in_date_range(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        limit: int = 100,
+    ) -> List[ConversationTranscript]:
+        """Get transcripts within a date range.
+
+        Args:
+            start_date: Start of the date range.
+            end_date: End of the date range.
+            limit: Maximum number of results.
+
+        Returns:
+            List of ConversationTranscript objects.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, session_id, person_id, person_name, transcript, audio_path,
+                   duration_seconds, started_at, ended_at, speaker_diarization,
+                   word_timestamps, metadata
+            FROM conversation_transcripts
+            WHERE started_at >= ? AND ended_at <= ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            [start_date, end_date, limit],
+        ).fetchall()
+
+        transcripts = []
+        for row in rows:
+            speaker_diarization = json.loads(row[9]) if row[9] else None
+            word_timestamps = json.loads(row[10]) if row[10] else None
+            metadata = json.loads(row[11]) if row[11] else {}
+            transcripts.append(
+                ConversationTranscript(
+                    id=row[0],
+                    session_id=row[1],
+                    person_id=row[2],
+                    person_name=row[3],
+                    transcript=row[4],
+                    audio_path=row[5],
+                    duration_seconds=row[6],
+                    started_at=row[7],
+                    ended_at=row[8],
+                    speaker_diarization=speaker_diarization,
+                    word_timestamps=word_timestamps,
+                    metadata=metadata,
+                )
+            )
+        return transcripts
 
     # ---------- Wake Event Operations ----------
 
