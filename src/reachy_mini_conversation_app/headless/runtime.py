@@ -15,9 +15,15 @@ from typing import Optional
 import numpy as np
 from dotenv import load_dotenv
 
+try:
+    from scipy import signal as scipy_signal
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 from reachy_mini_conversation_app.headless.state_machine import StateMachine, ConversationState
 from reachy_mini_conversation_app.headless.wake_word import WakeWordEngine
-from reachy_mini_conversation_app.headless.audio_router import AudioRouter
+from reachy_mini_conversation_app.headless.audio_router import AudioRouter, OPENAI_SAMPLE_RATE, NATIVE_SAMPLE_RATE
 from reachy_mini_conversation_app.headless.transcription import TranscriptionService, ConversationRecorder
 from reachy_mini_conversation_app.memory.manager import MemoryManager
 
@@ -43,11 +49,15 @@ class HeadlessRuntime:
 
         # Configuration from environment
         self._silence_timeout = float(os.getenv("SILENCE_TIMEOUT_SECONDS", "120"))
+        self._max_awake_seconds = float(os.getenv("MAX_AWAKE_SECONDS", "1800"))
+        self._min_sleep_seconds = float(os.getenv("MIN_SLEEP_SECONDS", "5"))
         self._wake_word_threshold = float(os.getenv("WAKE_WORD_CONFIDENCE_THRESHOLD", "0.5"))
         self._openai_api_key = os.getenv("OPENAI_API_KEY")
         # VAD (Voice Activity Detection) threshold for speech detection
         # Typical values: 500-2000 for int16 audio, lower = more sensitive
         self._speech_energy_threshold = float(os.getenv("SPEECH_ENERGY_THRESHOLD", "1000"))
+        # Pre-roll buffer seconds
+        self._preroll_seconds = float(os.getenv("PREROLL_SECONDS", "2.0"))
 
         # Components (initialized lazily)
         self._state_machine: Optional[StateMachine] = None
@@ -63,6 +73,37 @@ class HeadlessRuntime:
 
         logger.info("HeadlessRuntime created")
 
+    def _resample_audio(
+        self,
+        audio: np.ndarray,
+        from_rate: int,
+        to_rate: int,
+    ) -> np.ndarray:
+        """Resample audio to target sample rate.
+
+        Args:
+            audio: Input audio samples (int16).
+            from_rate: Input sample rate.
+            to_rate: Output sample rate.
+
+        Returns:
+            Resampled audio samples (int16).
+        """
+        if from_rate == to_rate or len(audio) == 0:
+            return audio
+
+        if SCIPY_AVAILABLE:
+            # Use scipy for quality resampling
+            num_samples = int(len(audio) * to_rate / from_rate)
+            resampled = scipy_signal.resample(audio.astype(np.float32), num_samples)
+            return np.clip(resampled, -32768, 32767).astype(np.int16)
+        else:
+            # Simple linear interpolation fallback
+            ratio = to_rate / from_rate
+            new_length = int(len(audio) * ratio)
+            indices = np.linspace(0, len(audio) - 1, new_length).astype(int)
+            return audio[indices]
+
     def _on_state_change(self, old_state: ConversationState, new_state: ConversationState) -> None:
         """Handle state changes.
 
@@ -71,6 +112,16 @@ class HeadlessRuntime:
             new_state: New state.
         """
         if new_state == ConversationState.AWAKE:
+            # Get pre-roll audio buffer (audio captured before wake word)
+            # This prevents clipping the start of user's speech
+            preroll_audio = None
+            if self._audio_router:
+                preroll_audio = self._audio_router.get_preroll_buffer()
+                self._audio_router.clear_preroll_buffer()
+                if len(preroll_audio) > 0:
+                    duration_ms = len(preroll_audio) / 24  # 24kHz = 24 samples/ms
+                    logger.info(f"Pre-roll buffer captured: {duration_ms:.0f}ms of audio")
+
             # Enable conversation audio routing
             if self._audio_router:
                 self._audio_router.enable_conversation()
@@ -78,6 +129,21 @@ class HeadlessRuntime:
             # Start recording
             if self._recorder:
                 self._recorder.start_session()
+                # Include pre-roll audio at the start of recording to prevent clipping
+                if preroll_audio is not None and len(preroll_audio) > 0:
+                    # Pre-roll is at 24kHz (OPENAI_SAMPLE_RATE), recorder is at native rate (48kHz)
+                    # Resample to match recorder's sample rate
+                    preroll_resampled = self._resample_audio(
+                        preroll_audio,
+                        from_rate=OPENAI_SAMPLE_RATE,
+                        to_rate=NATIVE_SAMPLE_RATE,
+                    )
+                    # Add pre-roll audio at the start of the recording
+                    self._recorder.add_audio(preroll_resampled)
+                    logger.info(
+                        f"Pre-roll audio added to recording: "
+                        f"{len(preroll_resampled)} samples ({len(preroll_resampled) / NATIVE_SAMPLE_RATE * 1000:.0f}ms)"
+                    )
 
             logger.info("System AWAKE - ready for conversation")
 
@@ -105,9 +171,11 @@ class HeadlessRuntime:
         # Initialize memory manager first (needed for wake word logging and transcription)
         self._memory_manager = MemoryManager(openai_api_key=self._openai_api_key)
 
-        # Initialize state machine
+        # Initialize state machine with full configuration
         self._state_machine = StateMachine(
             silence_timeout_seconds=self._silence_timeout,
+            max_awake_seconds=self._max_awake_seconds,
+            min_sleep_seconds=self._min_sleep_seconds,
             on_state_change=self._on_state_change,
         )
 
@@ -212,6 +280,11 @@ class HeadlessRuntime:
                 if rms_energy > self._speech_energy_threshold:
                     if self._state_machine:
                         await self._state_machine.on_user_speech()
+
+                # Check for max awake timeout (safety mechanism)
+                # Forces return to SLEEPING if AWAKE too long (prevents indefinite active state)
+                if self._state_machine:
+                    await self._state_machine.check_max_awake_timeout()
 
             except asyncio.CancelledError:
                 break
