@@ -26,6 +26,17 @@ dependencies = [
     #Database
     "duckdb",
 
+    #Face recognition (ONNX-based, no TensorFlow needed)
+    "onnxruntime",
+
+    #Headless mode - Wake word detection and CLI
+    "openwakeword",
+    "webrtcvad",
+    "typer",
+    "rich",
+    "scipy",
+    "numpy",
+
     #Reachy mini
     "reachy_mini_dances_library",
     "reachy_mini_toolbox",
@@ -60,6 +71,8 @@ dev = [
 
 [project.scripts]
 reachy-mini-conversation-app = "reachy_mini_conversation_app.main:main"
+reachy-mini-headless = "reachy_mini_conversation_app.headless.runtime:main"
+lily-cli = "reachy_mini_conversation_app.cli.main:app"
 
 [project.entry-points."reachy_mini_apps"]
 reachy_mini_conversation_app = "reachy_mini_conversation_app.main:ReachyMiniConversationApp"

@@ -35,6 +35,7 @@ class KnownPerson:
     id: int
     name: str
     photo_base64: str
+    face_embedding: Optional[List[float]] = None
     last_seen: Optional[datetime] = None
     recognition_count: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -50,6 +51,22 @@ class LearnedFact:
     context: str
     timestamp: datetime
     approved: bool = False
+
+
+@dataclass
+class ConversationTranscript:
+    """Represents a stored conversation transcript."""
+
+    id: int
+    session_id: str
+    person_id: Optional[int]
+    person_name: Optional[str]
+    transcript: str
+    audio_path: Optional[str]
+    duration_seconds: float
+    started_at: datetime
+    ended_at: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class MemoryDatabase:
@@ -113,6 +130,7 @@ class MemoryDatabase:
                 id INTEGER PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 photo_base64 TEXT NOT NULL,
+                face_embedding_json TEXT,
                 last_seen TIMESTAMP,
                 recognition_count INTEGER DEFAULT 0,
                 metadata JSON
@@ -150,6 +168,23 @@ class MemoryDatabase:
             )
         """)
 
+        # Conversation transcripts table for full conversation storage
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_transcripts (
+                id INTEGER PRIMARY KEY,
+                session_id VARCHAR(64) NOT NULL UNIQUE,
+                person_id INTEGER,
+                person_name VARCHAR(255),
+                transcript TEXT NOT NULL,
+                audio_path TEXT,
+                duration_seconds FLOAT DEFAULT 0.0,
+                started_at TIMESTAMP NOT NULL,
+                ended_at TIMESTAMP NOT NULL,
+                metadata JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Schema version tracking
         conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
@@ -168,6 +203,10 @@ class MemoryDatabase:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_persons_name ON known_persons(name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_approved ON learned_facts(approved)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON recognition_cache(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_session ON conversation_transcripts(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_person ON conversation_transcripts(person_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_started ON conversation_transcripts(started_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_ended ON conversation_transcripts(ended_at)")
 
         conn.commit()
 
@@ -336,11 +375,12 @@ class MemoryDatabase:
             self._conn.commit()
             return result is not None
 
-    def get_memories_by_source(self, source: str) -> List[Memory]:
+    def get_memories_by_source(self, source: str, limit: int = 100) -> List[Memory]:
         """Get all memories from a specific source.
 
         Args:
             source: The source to filter by.
+            limit: Maximum number of memories to return.
 
         Returns:
             List of Memory objects.
@@ -351,8 +391,9 @@ class MemoryDatabase:
             FROM user_memories
             WHERE source = ?
             ORDER BY timestamp DESC
+            LIMIT ?
             """,
-            [source],
+            [source, limit],
         ).fetchall()
 
         memories = []
@@ -376,6 +417,7 @@ class MemoryDatabase:
         name: str,
         photo_base64: str,
         metadata: Optional[Dict[str, Any]] = None,
+        face_embedding: Optional[List[float]] = None,
     ) -> int:
         """Add a new known person.
 
@@ -383,20 +425,22 @@ class MemoryDatabase:
             name: Person's name.
             photo_base64: Base64 encoded photo.
             metadata: Optional metadata.
+            face_embedding: Optional face embedding vector.
 
         Returns:
             The ID of the inserted person.
         """
         with self._lock:
             metadata_json = json.dumps(metadata) if metadata else None
+            embedding_json = json.dumps(face_embedding) if face_embedding else None
 
             result = self._conn.execute(
                 """
-                INSERT INTO known_persons (name, photo_base64, metadata, last_seen)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO known_persons (name, photo_base64, metadata, face_embedding_json, last_seen)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 RETURNING id
                 """,
-                [name, photo_base64, metadata_json],
+                [name, photo_base64, metadata_json, embedding_json],
             ).fetchone()
 
             self._conn.commit()
@@ -410,7 +454,7 @@ class MemoryDatabase:
         """
         rows = self._conn.execute(
             """
-            SELECT id, name, photo_base64, last_seen, recognition_count, metadata
+            SELECT id, name, photo_base64, face_embedding_json, last_seen, recognition_count, metadata
             FROM known_persons
             ORDER BY name
             """
@@ -418,14 +462,16 @@ class MemoryDatabase:
 
         persons = []
         for row in rows:
-            metadata = json.loads(row[5]) if row[5] else {}
+            metadata = json.loads(row[6]) if row[6] else {}
+            face_embedding = json.loads(row[3]) if row[3] else None
             persons.append(
                 KnownPerson(
                     id=row[0],
                     name=row[1],
                     photo_base64=row[2],
-                    last_seen=row[3],
-                    recognition_count=row[4],
+                    face_embedding=face_embedding,
+                    last_seen=row[4],
+                    recognition_count=row[5],
                     metadata=metadata,
                 )
             )
@@ -442,7 +488,7 @@ class MemoryDatabase:
         """
         row = self._conn.execute(
             """
-            SELECT id, name, photo_base64, last_seen, recognition_count, metadata
+            SELECT id, name, photo_base64, face_embedding_json, last_seen, recognition_count, metadata
             FROM known_persons
             WHERE id = ?
             """,
@@ -452,13 +498,15 @@ class MemoryDatabase:
         if row is None:
             return None
 
-        metadata = json.loads(row[5]) if row[5] else {}
+        metadata = json.loads(row[6]) if row[6] else {}
+        face_embedding = json.loads(row[3]) if row[3] else None
         return KnownPerson(
             id=row[0],
             name=row[1],
             photo_base64=row[2],
-            last_seen=row[3],
-            recognition_count=row[4],
+            face_embedding=face_embedding,
+            last_seen=row[4],
+            recognition_count=row[5],
             metadata=metadata,
         )
 
@@ -473,7 +521,7 @@ class MemoryDatabase:
         """
         row = self._conn.execute(
             """
-            SELECT id, name, photo_base64, last_seen, recognition_count, metadata
+            SELECT id, name, photo_base64, face_embedding_json, last_seen, recognition_count, metadata
             FROM known_persons
             WHERE LOWER(name) = LOWER(?)
             """,
@@ -483,13 +531,15 @@ class MemoryDatabase:
         if row is None:
             return None
 
-        metadata = json.loads(row[5]) if row[5] else {}
+        metadata = json.loads(row[6]) if row[6] else {}
+        face_embedding = json.loads(row[3]) if row[3] else None
         return KnownPerson(
             id=row[0],
             name=row[1],
             photo_base64=row[2],
-            last_seen=row[3],
-            recognition_count=row[4],
+            face_embedding=face_embedding,
+            last_seen=row[4],
+            recognition_count=row[5],
             metadata=metadata,
         )
 
@@ -541,6 +591,25 @@ class MemoryDatabase:
             result = self._conn.execute(
                 "UPDATE known_persons SET photo_base64 = ? WHERE id = ? RETURNING id",
                 [photo_base64, person_id],
+            ).fetchone()
+            self._conn.commit()
+            return result is not None
+
+    def update_person_embedding(self, person_id: int, face_embedding: List[float]) -> bool:
+        """Update a person's face embedding.
+
+        Args:
+            person_id: The person's ID.
+            face_embedding: New face embedding vector.
+
+        Returns:
+            True if updated, False if not found.
+        """
+        with self._lock:
+            embedding_json = json.dumps(face_embedding)
+            result = self._conn.execute(
+                "UPDATE known_persons SET face_embedding_json = ? WHERE id = ? RETURNING id",
+                [embedding_json, person_id],
             ).fetchone()
             self._conn.commit()
             return result is not None
@@ -800,3 +869,245 @@ class MemoryDatabase:
         """
         result = self._conn.execute("SELECT COUNT(*) FROM known_persons").fetchone()
         return result[0] if result else 0
+
+    # ---------- Conversation Transcript Operations ----------
+
+    def add_transcript(
+        self,
+        session_id: str,
+        transcript: str,
+        started_at: datetime,
+        ended_at: datetime,
+        person_id: Optional[int] = None,
+        person_name: Optional[str] = None,
+        audio_path: Optional[str] = None,
+        duration_seconds: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Add a new conversation transcript.
+
+        Args:
+            session_id: Unique session identifier.
+            transcript: Full transcript text.
+            started_at: When the conversation started.
+            ended_at: When the conversation ended.
+            person_id: Optional ID of the person who was speaking.
+            person_name: Optional name of the person.
+            audio_path: Optional path to the audio file.
+            duration_seconds: Duration of the conversation.
+            metadata: Optional metadata dictionary.
+
+        Returns:
+            The ID of the inserted transcript.
+        """
+        with self._lock:
+            metadata_json = json.dumps(metadata) if metadata else None
+
+            result = self._conn.execute(
+                """
+                INSERT INTO conversation_transcripts
+                (session_id, person_id, person_name, transcript, audio_path,
+                 duration_seconds, started_at, ended_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """,
+                [session_id, person_id, person_name, transcript, audio_path,
+                 duration_seconds, started_at, ended_at, metadata_json],
+            ).fetchone()
+
+            self._conn.commit()
+            return result[0] if result else -1
+
+    def get_transcript_by_session(self, session_id: str) -> Optional[ConversationTranscript]:
+        """Get a transcript by session ID.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            ConversationTranscript if found, None otherwise.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, session_id, person_id, person_name, transcript, audio_path,
+                   duration_seconds, started_at, ended_at, metadata
+            FROM conversation_transcripts
+            WHERE session_id = ?
+            """,
+            [session_id],
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        metadata = json.loads(row[9]) if row[9] else {}
+        return ConversationTranscript(
+            id=row[0],
+            session_id=row[1],
+            person_id=row[2],
+            person_name=row[3],
+            transcript=row[4],
+            audio_path=row[5],
+            duration_seconds=row[6],
+            started_at=row[7],
+            ended_at=row[8],
+            metadata=metadata,
+        )
+
+    def get_recent_transcripts(self, limit: int = 20) -> List[ConversationTranscript]:
+        """Get recent conversation transcripts.
+
+        Args:
+            limit: Maximum number of transcripts to return.
+
+        Returns:
+            List of ConversationTranscript objects.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, session_id, person_id, person_name, transcript, audio_path,
+                   duration_seconds, started_at, ended_at, metadata
+            FROM conversation_transcripts
+            ORDER BY ended_at DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+
+        transcripts = []
+        for row in rows:
+            metadata = json.loads(row[9]) if row[9] else {}
+            transcripts.append(
+                ConversationTranscript(
+                    id=row[0],
+                    session_id=row[1],
+                    person_id=row[2],
+                    person_name=row[3],
+                    transcript=row[4],
+                    audio_path=row[5],
+                    duration_seconds=row[6],
+                    started_at=row[7],
+                    ended_at=row[8],
+                    metadata=metadata,
+                )
+            )
+        return transcripts
+
+    def search_transcripts(self, query: str, limit: int = 20) -> List[ConversationTranscript]:
+        """Search transcripts by keyword.
+
+        Args:
+            query: Search query.
+            limit: Maximum number of results.
+
+        Returns:
+            List of matching ConversationTranscript objects.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, session_id, person_id, person_name, transcript, audio_path,
+                   duration_seconds, started_at, ended_at, metadata
+            FROM conversation_transcripts
+            WHERE LOWER(transcript) LIKE LOWER(?)
+            ORDER BY ended_at DESC
+            LIMIT ?
+            """,
+            [f"%{query}%", limit],
+        ).fetchall()
+
+        transcripts = []
+        for row in rows:
+            metadata = json.loads(row[9]) if row[9] else {}
+            transcripts.append(
+                ConversationTranscript(
+                    id=row[0],
+                    session_id=row[1],
+                    person_id=row[2],
+                    person_name=row[3],
+                    transcript=row[4],
+                    audio_path=row[5],
+                    duration_seconds=row[6],
+                    started_at=row[7],
+                    ended_at=row[8],
+                    metadata=metadata,
+                )
+            )
+        return transcripts
+
+    def get_transcripts_by_person(self, person_id: int, limit: int = 50) -> List[ConversationTranscript]:
+        """Get transcripts for a specific person.
+
+        Args:
+            person_id: The person's ID.
+            limit: Maximum number of results.
+
+        Returns:
+            List of ConversationTranscript objects.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, session_id, person_id, person_name, transcript, audio_path,
+                   duration_seconds, started_at, ended_at, metadata
+            FROM conversation_transcripts
+            WHERE person_id = ?
+            ORDER BY ended_at DESC
+            LIMIT ?
+            """,
+            [person_id, limit],
+        ).fetchall()
+
+        transcripts = []
+        for row in rows:
+            metadata = json.loads(row[9]) if row[9] else {}
+            transcripts.append(
+                ConversationTranscript(
+                    id=row[0],
+                    session_id=row[1],
+                    person_id=row[2],
+                    person_name=row[3],
+                    transcript=row[4],
+                    audio_path=row[5],
+                    duration_seconds=row[6],
+                    started_at=row[7],
+                    ended_at=row[8],
+                    metadata=metadata,
+                )
+            )
+        return transcripts
+
+    def delete_transcript(self, transcript_id: int) -> bool:
+        """Delete a transcript by ID.
+
+        Args:
+            transcript_id: The transcript's ID.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        with self._lock:
+            result = self._conn.execute(
+                "DELETE FROM conversation_transcripts WHERE id = ? RETURNING id",
+                [transcript_id],
+            ).fetchone()
+            self._conn.commit()
+            return result is not None
+
+    def get_transcript_count(self) -> int:
+        """Get total number of transcripts.
+
+        Returns:
+            Count of transcripts.
+        """
+        result = self._conn.execute("SELECT COUNT(*) FROM conversation_transcripts").fetchone()
+        return result[0] if result else 0
+
+    def get_total_conversation_duration(self) -> float:
+        """Get total duration of all conversations in seconds.
+
+        Returns:
+            Total duration in seconds.
+        """
+        result = self._conn.execute(
+            "SELECT COALESCE(SUM(duration_seconds), 0) FROM conversation_transcripts"
+        ).fetchone()
+        return result[0] if result else 0.0
