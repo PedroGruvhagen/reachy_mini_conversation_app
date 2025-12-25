@@ -1,0 +1,17 @@
+# Core robot tools
+dance
+stop_dance
+play_emotion
+stop_emotion
+camera
+do_nothing
+head_tracking
+move_head
+
+# Memory tools
+remember_this
+recall_memory
+
+# Person recognition tools
+learn_person
+who_is_this

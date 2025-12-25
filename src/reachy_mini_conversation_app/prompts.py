@@ -2,6 +2,7 @@ import re
 import sys
 import logging
 from pathlib import Path
+from typing import Optional, Any
 
 from reachy_mini_conversation_app.config import config
 
@@ -13,6 +14,28 @@ PROFILES_DIRECTORY = Path(__file__).parent / "profiles"
 PROMPTS_LIBRARY_DIRECTORY = Path(__file__).parent / "prompts"
 INSTRUCTIONS_FILENAME = "instructions.txt"
 VOICE_FILENAME = "voice.txt"
+
+# Global reference to memory manager (set from main.py)
+_memory_manager: Optional[Any] = None
+
+
+def set_memory_manager(manager: Any) -> None:
+    """Set the global memory manager reference for prompt injection.
+
+    Args:
+        manager: The MemoryManager instance.
+    """
+    global _memory_manager
+    _memory_manager = manager
+
+
+def get_memory_manager() -> Optional[Any]:
+    """Get the global memory manager reference.
+
+    Returns:
+        The MemoryManager instance or None.
+    """
+    return _memory_manager
 
 
 def _expand_prompt_includes(content: str) -> str:
@@ -60,7 +83,11 @@ def _expand_prompt_includes(content: str) -> str:
 
 
 def get_session_instructions() -> str:
-    """Get session instructions, loading from REACHY_MINI_CUSTOM_PROFILE if set."""
+    """Get session instructions, loading from REACHY_MINI_CUSTOM_PROFILE if set.
+
+    Also injects relevant memories and current person context if a memory
+    manager is available.
+    """
     profile = config.REACHY_MINI_CUSTOM_PROFILE
     if not profile:
         logger.info(f"Loading default prompt from {PROMPTS_LIBRARY_DIRECTORY / 'default_prompt.txt'}")
@@ -75,6 +102,12 @@ def get_session_instructions() -> str:
             if instructions:
                 # Expand [<name>] placeholders with content from prompts library
                 expanded_instructions = _expand_prompt_includes(instructions)
+
+                # Inject memory context if memory manager is available
+                memory_context = _get_memory_context()
+                if memory_context:
+                    expanded_instructions = f"{expanded_instructions}\n\n{memory_context}"
+
                 return expanded_instructions
             logger.error(f"Profile '{profile}' has empty {INSTRUCTIONS_FILENAME}")
             sys.exit(1)
@@ -83,6 +116,22 @@ def get_session_instructions() -> str:
     except Exception as e:
         logger.error(f"Failed to load instructions from profile '{profile}': {e}")
         sys.exit(1)
+
+
+def _get_memory_context() -> str:
+    """Get formatted memory context for prompt injection.
+
+    Returns:
+        Formatted string with current person and relevant memories.
+    """
+    if _memory_manager is None:
+        return ""
+
+    try:
+        return _memory_manager.get_full_context_for_prompt()
+    except Exception as e:
+        logger.warning(f"Failed to get memory context: {e}")
+        return ""
 
 
 def get_session_voice(default: str = "cedar") -> str:

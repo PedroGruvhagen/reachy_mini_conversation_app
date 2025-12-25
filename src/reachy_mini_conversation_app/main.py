@@ -42,11 +42,15 @@ def run(
 ) -> None:
     """Run the Reachy Mini conversation app."""
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
+    from pathlib import Path
+
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.console import LocalStream
     from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
+    from reachy_mini_conversation_app.memory import MemoryManager
+    from reachy_mini_conversation_app.prompts import set_memory_manager
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
@@ -90,12 +94,30 @@ def run(
 
     head_wobbler = HeadWobbler(set_speech_offsets=movement_manager.set_speech_offsets)
 
+    # Initialize memory manager
+    memory_manager = MemoryManager()
+    set_memory_manager(memory_manager)
+    logger.info("Memory manager initialized")
+
+    # Preload memories from personality files
+    current_file_path_for_personality = Path(__file__).parent
+    personality_dir = current_file_path_for_personality.parent.parent.parent / "personality-and-user"
+    if personality_dir.exists():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            count = loop.run_until_complete(memory_manager.preload_memories_from_files(personality_dir))
+            logger.info(f"Preloaded {count} memories from personality files")
+        except Exception as e:
+            logger.warning(f"Failed to preload memories: {e}")
+
     deps = ToolDependencies(
         reachy_mini=robot,
         movement_manager=movement_manager,
         camera_worker=camera_worker,
         vision_manager=vision_manager,
         head_wobbler=head_wobbler,
+        memory_manager=memory_manager,
     )
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     logger.debug(f"Current file absolute path: {current_file_path}")
@@ -189,6 +211,10 @@ def run(
             camera_worker.stop()
         if vision_manager:
             vision_manager.stop()
+        if memory_manager:
+            memory_manager.close()
+            set_memory_manager(None)
+            logger.info("Memory manager closed")
 
         # Ensure media is explicitly closed before disconnecting
         try:
