@@ -9,6 +9,7 @@ system without any UI. It includes:
 - Systemd service integration
 - Error handling and recovery utilities
 - Security hardening utilities
+- Backup and restore utilities
 """
 
 from reachy_mini_conversation_app.headless.state_machine import ConversationState, StateMachine
@@ -52,6 +53,18 @@ from reachy_mini_conversation_app.headless.security import (
     # Security Auditing
     SecurityAuditor,
 )
+from reachy_mini_conversation_app.headless.backup import (
+    # Data Classes
+    BackupManifest,
+    BackupInfo,
+    RestoreResult,
+    # Backup Manager
+    BackupManager,
+    # Convenience Functions
+    create_backup,
+    restore_latest_backup,
+    list_available_backups,
+)
 
 
 __all__ = [
@@ -88,4 +101,12 @@ __all__ = [
     "RateLimiter",
     "rate_limited",
     "SecurityAuditor",
+    # Backup utilities
+    "BackupManifest",
+    "BackupInfo",
+    "RestoreResult",
+    "BackupManager",
+    "create_backup",
+    "restore_latest_backup",
+    "list_available_backups",
 ]
