@@ -29,13 +29,14 @@ dependencies = [
     #Face recognition (ONNX-based, no TensorFlow needed)
     "onnxruntime",
 
-    #Headless mode - Wake word detection and CLI
+    #Headless mode - Wake word detection, audio capture, and CLI
     "openwakeword",
     "webrtcvad",
     "typer",
     "rich",
     "scipy",
     "numpy",
+    "sounddevice",  # Audio capture for headless mode
 
     #Reachy mini
     "reachy_mini_dances_library",

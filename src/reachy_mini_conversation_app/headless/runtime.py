@@ -21,6 +21,12 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+
 from reachy_mini_conversation_app.headless.state_machine import StateMachine, ConversationState
 from reachy_mini_conversation_app.headless.wake_word import WakeWordEngine
 from reachy_mini_conversation_app.headless.audio_router import AudioRouter, OPENAI_SAMPLE_RATE, NATIVE_SAMPLE_RATE
@@ -58,6 +64,12 @@ class HeadlessRuntime:
         self._speech_energy_threshold = float(os.getenv("SPEECH_ENERGY_THRESHOLD", "1000"))
         # Pre-roll buffer seconds
         self._preroll_seconds = float(os.getenv("PREROLL_SECONDS", "2.0"))
+
+        # Audio device configuration
+        self._audio_device = os.getenv("AUDIO_INPUT_DEVICE", None)  # None = default device
+        self._audio_sample_rate = int(os.getenv("AUDIO_SAMPLE_RATE", str(NATIVE_SAMPLE_RATE)))
+        self._audio_channels = 1  # Mono
+        self._audio_block_size = 1024  # Samples per block
 
         # Components (initialized lazily)
         self._state_machine: Optional[StateMachine] = None
@@ -98,11 +110,14 @@ class HeadlessRuntime:
             resampled = scipy_signal.resample(audio.astype(np.float32), num_samples)
             return np.clip(resampled, -32768, 32767).astype(np.int16)
         else:
-            # Simple linear interpolation fallback
-            ratio = to_rate / from_rate
-            new_length = int(len(audio) * ratio)
-            indices = np.linspace(0, len(audio) - 1, new_length).astype(int)
-            return audio[indices]
+            # Linear interpolation fallback (better than nearest-neighbor)
+            # Uses np.interp for proper anti-aliasing
+            new_length = int(len(audio) * to_rate / from_rate)
+            return np.interp(
+                np.linspace(0, len(audio) - 1, new_length),
+                np.arange(len(audio)),
+                audio.astype(np.float32),
+            ).astype(np.int16)
 
     def _on_state_change(self, old_state: ConversationState, new_state: ConversationState) -> None:
         """Handle state changes.
@@ -188,8 +203,11 @@ class HeadlessRuntime:
         if not self._wake_word_engine.initialize():
             logger.warning("Wake word engine failed to initialize - will run without wake word")
 
-        # Initialize audio router
-        self._audio_router = AudioRouter()
+        # Initialize audio router with configured sample rate and pre-roll duration
+        self._audio_router = AudioRouter(
+            input_sample_rate=self._audio_sample_rate,
+            preroll_seconds=self._preroll_seconds,
+        )
 
         # Initialize transcription service with database for storage
         self._transcription_service = TranscriptionService(
@@ -320,6 +338,132 @@ class HeadlessRuntime:
 
         logger.info("Recorder loop ended")
 
+    async def _audio_capture_loop(self) -> None:
+        """Background loop for capturing audio from microphone.
+
+        Uses sounddevice to capture audio and routes it to all consumers
+        via the AudioRouter. This is the main audio source for the system.
+
+        Note: sounddevice callbacks run in a C-thread, so we use
+        loop.call_soon_threadsafe() to safely insert audio into the asyncio queue.
+        """
+        if not SOUNDDEVICE_AVAILABLE:
+            logger.error("sounddevice not available - cannot capture audio")
+            logger.error("Install with: pip install sounddevice")
+            return
+
+        if not self._audio_router:
+            logger.error("AudioRouter not initialized")
+            return
+
+        logger.info(
+            f"Starting audio capture: device={self._audio_device or 'default'}, "
+            f"rate={self._audio_sample_rate}Hz, channels={self._audio_channels}, "
+            f"block_size={self._audio_block_size}"
+        )
+
+        # Create asyncio queue for audio data
+        audio_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=100)
+
+        # Get event loop reference for thread-safe queue insertion
+        # sounddevice callback runs in a C-thread, so we need call_soon_threadsafe
+        loop = asyncio.get_running_loop()
+
+        def audio_callback(
+            indata: np.ndarray,
+            frames: int,
+            time_info: object,
+            status: object,
+        ) -> None:
+            """Callback from sounddevice for each audio block.
+
+            IMPORTANT: This runs in a C-thread, not the asyncio event loop.
+            We use loop.call_soon_threadsafe() to safely insert into the queue.
+            """
+            if status:
+                logger.warning(f"Audio input status: {status}")
+
+            # Convert float32 to int16
+            # sounddevice returns float32 in range [-1.0, 1.0]
+            audio_int16 = (indata[:, 0] * 32767).astype(np.int16)
+
+            # Thread-safe insertion into asyncio queue
+            # Using call_soon_threadsafe to avoid race conditions
+            def try_put() -> None:
+                try:
+                    audio_queue.put_nowait(audio_int16)
+                except asyncio.QueueFull:
+                    pass  # Drop frame if queue is full
+
+            loop.call_soon_threadsafe(try_put)
+
+        # Open audio stream
+        try:
+            # Convert device name to index if specified
+            device_index = None
+            if self._audio_device:
+                try:
+                    device_index = int(self._audio_device)
+                except ValueError:
+                    # Device specified by name, let sounddevice resolve it
+                    device_index = self._audio_device
+
+            stream = sd.InputStream(
+                samplerate=self._audio_sample_rate,
+                channels=self._audio_channels,
+                dtype="float32",
+                blocksize=self._audio_block_size,
+                device=device_index,
+                callback=audio_callback,
+            )
+
+            with stream:
+                logger.info("Audio capture started")
+                while self._running:
+                    try:
+                        # Get audio from callback queue
+                        audio_data = await asyncio.wait_for(
+                            audio_queue.get(),
+                            timeout=0.5,
+                        )
+                        # Route to all consumers
+                        await self._audio_router.route_audio(audio_data)
+
+                    except asyncio.TimeoutError:
+                        # No audio data, check if still running
+                        continue
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error(f"Error routing audio: {e}")
+                        await asyncio.sleep(0.1)
+
+        except sd.PortAudioError as e:
+            logger.error(f"PortAudio error: {e}")
+            logger.error("Check audio device configuration")
+            # List available devices for debugging
+            try:
+                devices = sd.query_devices()
+                logger.info(f"Available audio devices:\n{devices}")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Failed to open audio stream: {e}")
+
+        logger.info("Audio capture loop ended")
+
+    def _list_audio_devices(self) -> None:
+        """Log available audio devices for debugging."""
+        if not SOUNDDEVICE_AVAILABLE:
+            logger.warning("sounddevice not available")
+            return
+
+        try:
+            devices = sd.query_devices()
+            logger.info(f"Available audio devices:\n{devices}")
+        except Exception as e:
+            logger.warning(f"Failed to query audio devices: {e}")
+
     async def run(self) -> None:
         """Run the headless runtime main loop."""
         logger.info("Starting HeadlessRuntime...")
@@ -331,11 +475,16 @@ class HeadlessRuntime:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self._handle_shutdown)
 
+        # Log available audio devices for debugging
+        self._list_audio_devices()
+
         # Start background tasks
+        # Audio capture MUST start first - it feeds all other loops
         tasks = [
-            asyncio.create_task(self._wake_word_loop()),
-            asyncio.create_task(self._conversation_loop()),
-            asyncio.create_task(self._recorder_loop()),
+            asyncio.create_task(self._audio_capture_loop(), name="audio-capture"),
+            asyncio.create_task(self._wake_word_loop(), name="wake-word"),
+            asyncio.create_task(self._conversation_loop(), name="conversation"),
+            asyncio.create_task(self._recorder_loop(), name="recorder"),
         ]
 
         logger.info("HeadlessRuntime running - listening for wake word...")

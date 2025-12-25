@@ -4,10 +4,10 @@ Routes audio from a single capture source to wake word engine,
 conversation handler, and background recorder based on current state.
 """
 
+import time
 import asyncio
 import logging
 from typing import Optional
-from enum import Enum
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,14 +28,6 @@ WAKE_WORD_SAMPLE_RATE = 16000  # OpenWakeWord requirement
 OPENAI_SAMPLE_RATE = 24000  # OpenAI Realtime requirement
 
 
-class AudioConsumer(Enum):
-    """Audio consumer types."""
-
-    WAKE_WORD = "wake_word"  # 16kHz, always active in SLEEPING
-    CONVERSATION = "conversation"  # 24kHz, active in AWAKE
-    RECORDER = "recorder"  # Native rate, always active
-
-
 class AudioRouter:
     """Routes audio to multiple consumers with appropriate resampling.
 
@@ -47,15 +39,18 @@ class AudioRouter:
         self,
         input_sample_rate: int = NATIVE_SAMPLE_RATE,
         max_queue_size: int = 100,
+        preroll_seconds: float = 2.0,
     ) -> None:
         """Initialize the audio router.
 
         Args:
             input_sample_rate: Sample rate of input audio.
             max_queue_size: Maximum frames in each consumer queue.
+            preroll_seconds: Seconds of audio to buffer before wake word.
         """
         self._input_sample_rate = input_sample_rate
         self._max_queue_size = max_queue_size
+        self._preroll_seconds = preroll_seconds
 
         # Consumer queues
         self._wake_word_queue: asyncio.Queue[NDArray[np.int16]] = asyncio.Queue(
@@ -75,7 +70,6 @@ class AudioRouter:
 
         # Pre-roll buffer for capturing audio before wake word
         self._preroll_buffer: list[NDArray[np.int16]] = []
-        self._preroll_seconds = 2.0
         self._preroll_max_frames = int(
             self._preroll_seconds * OPENAI_SAMPLE_RATE / 1024  # Assuming ~1024 samples per frame
         )
@@ -83,10 +77,12 @@ class AudioRouter:
         # Stats
         self._frames_routed = 0
         self._frames_dropped = 0
+        self._slow_routes_count = 0
+        self._total_route_time_ms = 0.0
 
         logger.info(
             f"AudioRouter initialized: input_rate={input_sample_rate}Hz, "
-            f"queue_size={max_queue_size}"
+            f"queue_size={max_queue_size}, preroll={preroll_seconds}s"
         )
 
     @property
@@ -145,11 +141,14 @@ class AudioRouter:
             return audio
 
         if not SCIPY_AVAILABLE:
-            # Simple decimation/interpolation fallback
-            ratio = to_rate / from_rate
-            new_length = int(len(audio) * ratio)
-            indices = np.linspace(0, len(audio) - 1, new_length).astype(int)
-            return audio[indices]
+            # Linear interpolation fallback (better than nearest-neighbor)
+            # Uses np.interp for proper anti-aliasing
+            new_length = int(len(audio) * to_rate / from_rate)
+            return np.interp(
+                np.linspace(0, len(audio) - 1, new_length),
+                np.arange(len(audio)),
+                audio.astype(np.float32),
+            ).astype(np.int16)
 
         # Use scipy for quality resampling
         num_samples = int(len(audio) * to_rate / from_rate)
@@ -161,7 +160,10 @@ class AudioRouter:
 
         Args:
             audio_data: Audio samples at input sample rate.
+
+        Performance: Logs warning if routing takes >10ms, debug if >5ms.
         """
+        start_time = time.perf_counter()
         self._frames_routed += 1
 
         # Route to wake word consumer (16kHz)
@@ -214,6 +216,16 @@ class AudioRouter:
                     self._recorder_queue.put_nowait(audio_data.copy())
                 except asyncio.QueueEmpty:
                     pass
+
+        # Performance monitoring
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self._total_route_time_ms += elapsed_ms
+
+        if elapsed_ms > 10:
+            self._slow_routes_count += 1
+            logger.warning(f"Audio routing slow: {elapsed_ms:.2f}ms (frame #{self._frames_routed})")
+        elif elapsed_ms > 5:
+            logger.debug(f"Audio routing: {elapsed_ms:.2f}ms")
 
     async def get_wake_word_audio(self, timeout: float = 0.1) -> Optional[NDArray[np.int16]]:
         """Get audio frame for wake word processing.
@@ -280,15 +292,23 @@ class AudioRouter:
         """Clear the pre-roll buffer."""
         self._preroll_buffer.clear()
 
-    def get_stats(self) -> dict[str, int]:
+    def get_stats(self) -> dict[str, float | int]:
         """Get router statistics.
 
         Returns:
-            Dictionary with routing stats.
+            Dictionary with routing stats including performance metrics.
         """
+        avg_route_time_ms = (
+            self._total_route_time_ms / self._frames_routed
+            if self._frames_routed > 0
+            else 0.0
+        )
         return {
             "frames_routed": self._frames_routed,
             "frames_dropped": self._frames_dropped,
+            "slow_routes_count": self._slow_routes_count,
+            "avg_route_time_ms": round(avg_route_time_ms, 3),
+            "total_route_time_ms": round(self._total_route_time_ms, 3),
             "wake_word_queue_size": self._wake_word_queue.qsize(),
             "conversation_queue_size": self._conversation_queue.qsize(),
             "recorder_queue_size": self._recorder_queue.qsize(),
@@ -297,9 +317,11 @@ class AudioRouter:
 
     def shutdown(self) -> None:
         """Shutdown the audio router."""
+        stats = self.get_stats()
         logger.info(
-            f"AudioRouter shutting down: {self._frames_routed} routed, "
-            f"{self._frames_dropped} dropped"
+            f"AudioRouter shutting down: {stats['frames_routed']} routed, "
+            f"{stats['frames_dropped']} dropped, {stats['slow_routes_count']} slow, "
+            f"avg {stats['avg_route_time_ms']:.3f}ms/frame"
         )
         self._wake_word_enabled = False
         self._conversation_enabled = False
