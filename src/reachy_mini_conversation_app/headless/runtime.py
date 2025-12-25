@@ -7,6 +7,7 @@ Orchestrates wake word detection, state machine, and conversation handling.
 import os
 import sys
 import signal
+import socket
 import asyncio
 import logging
 from pathlib import Path
@@ -35,6 +36,37 @@ from reachy_mini_conversation_app.memory.manager import MemoryManager
 
 
 logger = logging.getLogger(__name__)
+
+
+def systemd_notify(message: str) -> bool:
+    """Send a notification to systemd.
+
+    Uses the NOTIFY_SOCKET environment variable to communicate with systemd.
+    This is a simple implementation that doesn't require external dependencies.
+
+    Args:
+        message: The notification message (e.g., "READY=1", "WATCHDOG=1").
+
+    Returns:
+        True if notification was sent, False otherwise.
+    """
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return False
+
+    try:
+        # Handle abstract socket (starts with @)
+        if notify_socket.startswith("@"):
+            notify_socket = "\0" + notify_socket[1:]
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.connect(notify_socket)
+        sock.sendall(message.encode())
+        sock.close()
+        return True
+    except Exception as e:
+        logger.debug(f"Failed to send systemd notification: {e}")
+        return False
 
 
 class HeadlessRuntime:
@@ -452,6 +484,41 @@ class HeadlessRuntime:
 
         logger.info("Audio capture loop ended")
 
+    async def _watchdog_loop(self) -> None:
+        """Background loop for systemd watchdog notification.
+
+        Sends periodic WATCHDOG=1 messages to systemd to indicate
+        the service is healthy. If these stop, systemd will restart
+        the service based on WatchdogSec configuration.
+        """
+        # Check for systemd watchdog configuration
+        watchdog_usec = os.environ.get("WATCHDOG_USEC")
+        if not watchdog_usec:
+            logger.debug("Systemd watchdog not configured")
+            return
+
+        try:
+            watchdog_sec = int(watchdog_usec) / 1_000_000 / 2  # Notify at half the interval
+            if watchdog_sec < 1:
+                watchdog_sec = 1
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid WATCHDOG_USEC: {watchdog_usec}")
+            return
+
+        logger.info(f"Systemd watchdog enabled, notifying every {watchdog_sec:.1f}s")
+
+        while self._running:
+            try:
+                systemd_notify("WATCHDOG=1")
+                await asyncio.sleep(watchdog_sec)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in watchdog loop: {e}")
+                await asyncio.sleep(watchdog_sec)
+
+        logger.info("Watchdog loop ended")
+
     def _list_audio_devices(self) -> None:
         """Log available audio devices for debugging."""
         if not SOUNDDEVICE_AVAILABLE:
@@ -485,7 +552,12 @@ class HeadlessRuntime:
             asyncio.create_task(self._wake_word_loop(), name="wake-word"),
             asyncio.create_task(self._conversation_loop(), name="conversation"),
             asyncio.create_task(self._recorder_loop(), name="recorder"),
+            asyncio.create_task(self._watchdog_loop(), name="watchdog"),
         ]
+
+        # Notify systemd that we're ready
+        if systemd_notify("READY=1"):
+            logger.info("Notified systemd: service ready")
 
         logger.info("HeadlessRuntime running - listening for wake word...")
         print("\n🎤 Lily is listening... Say 'Hey Lily' to wake up!\n")
@@ -512,8 +584,11 @@ class HeadlessRuntime:
         self._shutdown_event.set()
 
     async def shutdown(self) -> None:
-        """Shutdown all components."""
+        """Shutdown all components gracefully."""
         logger.info("Shutting down HeadlessRuntime...")
+
+        # Notify systemd we're stopping
+        systemd_notify("STOPPING=1")
 
         self._running = False
         self._shutdown_event.set()

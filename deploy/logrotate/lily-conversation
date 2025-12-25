@@ -1,0 +1,34 @@
+# Logrotate configuration for Lily Conversation Service
+# Install to /etc/logrotate.d/lily-conversation
+#
+# Uses copytruncate because systemd keeps file descriptors open.
+# This copies the content then truncates the original in place,
+# so systemd continues writing to the same file.
+
+/home/*/.reachy_mini/logs/*.log
+{
+    # Rotate daily
+    daily
+
+    # Keep 14 days of logs
+    rotate 14
+
+    # Compress rotated logs
+    compress
+    delaycompress
+
+    # Don't error if log is missing
+    missingok
+
+    # Don't rotate if empty
+    notifempty
+
+    # IMPORTANT: Use copytruncate for systemd append mode
+    # This copies the log content then truncates the original file in place.
+    # Required because systemd keeps the file descriptor open.
+    copytruncate
+
+    # Add date extension to rotated logs
+    dateext
+    dateformat -%Y%m%d
+}

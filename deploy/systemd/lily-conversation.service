@@ -1,0 +1,58 @@
+# Reachy Mini Lily Conversation Service
+# Systemd user service for headless operation
+#
+# Install: scripts/install_service.sh
+# Status: systemctl --user status lily-conversation
+# Logs: journalctl --user -u lily-conversation -f
+
+[Unit]
+Description=Reachy Mini Lily Conversation Service (Headless)
+Documentation=https://github.com/PedroGruvhagen/reachy_mini_conversation_app
+After=pulseaudio.service pipewire.service sound.target
+Wants=pulseaudio.service pipewire.service
+
+[Service]
+# Use notify type for proper readiness signaling
+# The service sends READY=1 when fully initialized
+Type=notify
+NotifyAccess=main
+
+# Main process - headless conversation runtime
+ExecStart=%h/.venv/bin/reachy-mini-headless
+
+# Working directory for .env file discovery
+WorkingDirectory=%h
+
+# Restart policy - restart on failure, but limit burst
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitInterval=300
+
+# Logging to files (in addition to journal)
+StandardOutput=append:%h/.reachy_mini/logs/conversation.log
+StandardError=append:%h/.reachy_mini/logs/conversation-error.log
+
+# Environment configuration
+Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=%h/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Load environment variables from .env file
+EnvironmentFile=-%h/.reachy_mini/.env
+
+# Resource limits to prevent runaway
+MemoryMax=2G
+MemoryHigh=1G
+CPUQuota=80%
+
+# Watchdog - service must notify systemd every 60s or be restarted
+WatchdogSec=120
+
+# Security hardening (optional, adjust as needed)
+# ProtectHome=read-only
+# ProtectSystem=strict
+# ReadWritePaths=%h/.reachy_mini
+# NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
