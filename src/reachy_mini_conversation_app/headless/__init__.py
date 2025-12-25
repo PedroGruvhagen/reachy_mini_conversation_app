@@ -8,6 +8,7 @@ system without any UI. It includes:
 - Full conversation transcription
 - Systemd service integration
 - Error handling and recovery utilities
+- Security hardening utilities
 """
 
 from reachy_mini_conversation_app.headless.state_machine import ConversationState, StateMachine
@@ -34,6 +35,22 @@ from reachy_mini_conversation_app.headless.error_handling import (
     ComponentHealth,
     error_aggregator,
     recovery_manager,
+)
+from reachy_mini_conversation_app.headless.security import (
+    # API Key Validation
+    APIKeyValidator,
+    # Secure File Handling
+    SecureFileHandler,
+    # Input Sanitization
+    InputSanitizer,
+    # Secure Logging
+    SecureLogger,
+    SecureLoggingFilter,
+    # Rate Limiting
+    RateLimiter,
+    rate_limited,
+    # Security Auditing
+    SecurityAuditor,
 )
 
 
@@ -62,4 +79,13 @@ __all__ = [
     # Global instances
     "error_aggregator",
     "recovery_manager",
+    # Security utilities
+    "APIKeyValidator",
+    "SecureFileHandler",
+    "InputSanitizer",
+    "SecureLogger",
+    "SecureLoggingFilter",
+    "RateLimiter",
+    "rate_limited",
+    "SecurityAuditor",
 ]
